@@ -8,24 +8,30 @@ import {
 
 export const runtime = "nodejs";
 
-/** Curated genres for the category filter (Steam tags). */
+/** Curated categories for the filter — official SteamSpy genres + niche tags. */
 export const TOP_CATEGORIES = [
-  "Horror",
+  // Official SteamSpy store genres
+  "Action",
   "Indie",
   "Adventure",
-  "Metroidvania",
-  "Action",
   "RPG",
   "Strategy",
   "Simulation",
   "Casual",
+  "Sports",
+  "Racing",
+  "Massively Multiplayer",
+  "Free To Play",
+  "Early Access",
+  // Niche Steam tags (not SteamSpy genres)
+  "Horror",
+  "Metroidvania",
+  "Roguelike",
+  "Souls-like",
   "Puzzle",
   "Platformer",
   "Survival",
-  "Roguelike",
   "Multiplayer",
-  "Sports",
-  "Racing",
   "Shooter",
   "FPS",
   "Open World",
@@ -36,7 +42,6 @@ export const TOP_CATEGORIES = [
   "Fighting",
   "Stealth",
   "Action RPG",
-  "Souls-like",
   "Survival Horror",
   "RTS",
   "Grand Strategy",
@@ -53,8 +58,27 @@ export const TOP_CATEGORIES = [
   "Action-Adventure",
 ] as const;
 
+/** Categories resolved against `genres` / `game_genres`. */
+const OFFICIAL_GENRE_SET = new Set(
+  [
+    "Action",
+    "Indie",
+    "Adventure",
+    "RPG",
+    "Strategy",
+    "Simulation",
+    "Casual",
+    "Sports",
+    "Racing",
+    "Massively Multiplayer",
+    "Free To Play",
+    "Early Access",
+  ].map((s) => s.toLowerCase()),
+);
+
 const CATEGORY_ALIASES: Record<string, readonly string[]> = {
   Roguelike: ["Roguelike", "Rogue-like", "Roguelite", "Rogue-lite"],
+  "Free To Play": ["Free To Play", "Free to Play"],
 };
 
 const SORTS = [
@@ -128,12 +152,16 @@ function categoryMatchTags(category: string): string[] | null {
     (c) => c.toLowerCase() === category.toLowerCase(),
   );
   if (!canonical) {
-    // Allow any Steam tag name the UI passes through
+    // Allow any Steam tag / genre name the UI passes through
     return [category.toLowerCase()];
   }
   const aliases = CATEGORY_ALIASES[canonical];
   if (aliases) return aliases.map((a) => a.toLowerCase());
   return [canonical.toLowerCase()];
+}
+
+function isOfficialGenreCategory(matchNames: string[]): boolean {
+  return matchNames.some((n) => OFFICIAL_GENRE_SET.has(n));
 }
 
 function ownersLoSql(alias: string): string {
@@ -198,13 +226,34 @@ export async function GET(req: NextRequest) {
 
     if (matchTags) {
       const p = push(matchTags);
-      where.push(`EXISTS (
-        SELECT 1
-        FROM game_tags gt
-        JOIN tags t ON t.tag_id = gt.tag_id
-        WHERE gt.app_id = g.app_id
-          AND LOWER(t.tag_name) = ANY(${p}::text[])
-      )`);
+      if (isOfficialGenreCategory(matchTags)) {
+        // Hybrid: official genres via game_genres, also allow tag alias match
+        // (e.g. Free to Play tag) so older filters still work.
+        where.push(`(
+          EXISTS (
+            SELECT 1
+            FROM game_genres gg
+            JOIN genres gen ON gen.genre_id = gg.genre_id
+            WHERE gg.app_id = g.app_id
+              AND LOWER(gen.genre_name) = ANY(${p}::text[])
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM game_tags gt
+            JOIN tags t ON t.tag_id = gt.tag_id
+            WHERE gt.app_id = g.app_id
+              AND LOWER(t.tag_name) = ANY(${p}::text[])
+          )
+        )`);
+      } else {
+        where.push(`EXISTS (
+          SELECT 1
+          FROM game_tags gt
+          JOIN tags t ON t.tag_id = gt.tag_id
+          WHERE gt.app_id = g.app_id
+            AND LOWER(t.tag_name) = ANY(${p}::text[])
+        )`);
+      }
     }
 
     // Price filters use COALESCE(current USD, base_price_usd).

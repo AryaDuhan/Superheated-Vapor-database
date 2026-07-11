@@ -10,32 +10,38 @@ import { IS_FREE_SQL } from "@/lib/isFree";
 export const runtime = "nodejs";
 
 /**
- * Curated Steam genres only (case-insensitive match on tags.tag_name).
- * Excludes vibe/meta tags: Trading, Fast-Paced, Lore-Rich, Competitive, etc.
- * Order = display preference when selecting the top panel categories.
- *
- * Spelling variants (e.g. Rogue-like / Rogue-lite) are listed once here and
- * expanded via CATEGORY_ALIASES so they share a single display box.
+ * Broad Store / SteamSpy genres — matched against `genres.genre_name`.
+ * Multi-membership: a game appears in every genre SteamSpy listed.
+ * Spelling matches SteamSpy (`Free To Play`, not tag-style `Free to Play`).
  */
-const PREFERRED_GENRES = [
-  "Horror",
+const OFFICIAL_GENRES = [
+  "Action",
   "Indie",
   "Adventure",
-  "Metroidvania",
-  "Action",
   "RPG",
   "Strategy",
   "Simulation",
   "Casual",
+  "Sports",
+  "Racing",
+  "Massively Multiplayer",
+  "Free To Play",
+  "Early Access",
+] as const;
+
+/**
+ * Niches that are Steam *tags*, not SteamSpy store genres.
+ * Keep tag denylist / pollution filters for these.
+ */
+const NICHE_TAGS = [
+  "Horror",
+  "Metroidvania",
+  "Roguelike",
+  "Souls-like",
   "Puzzle",
   "Platformer",
   "Survival",
-  "Roguelike",
   "Multiplayer",
-  "Free to Play",
-  "Early Access",
-  "Sports",
-  "Racing",
   "Shooter",
   "FPS",
   "Open World",
@@ -46,7 +52,6 @@ const PREFERRED_GENRES = [
   "Fighting",
   "Stealth",
   "Action RPG",
-  "Souls-like",
   "Survival Horror",
   "RTS",
   "Grand Strategy",
@@ -63,11 +68,10 @@ const PREFERRED_GENRES = [
   "Action-Adventure",
 ] as const;
 
-/**
- * Steam tag variants → one display category.
- * Keys are PREFERRED_GENRES entries; values are all tag_name spellings to match.
- */
-const CATEGORY_ALIASES: Record<string, readonly string[]> = {
+/** Display preference order (official first, then niches). */
+const DISPLAY_ORDER = [...OFFICIAL_GENRES, ...NICHE_TAGS] as const;
+
+const TAG_ALIASES: Record<string, readonly string[]> = {
   Roguelike: ["Roguelike", "Rogue-like", "Roguelite", "Rogue-lite"],
 };
 
@@ -76,6 +80,7 @@ type CategoryRow = {
   tag_name: string;
   num_games: string;
   avg_ccu: string;
+  source: string;
 };
 
 type GameRow = {
@@ -97,11 +102,10 @@ type RankedGame = {
   rank: number;
 };
 
-/** All lowercase Steam tag names to match (includes alias spellings). */
-function matchTagsLower(): string[] {
+function nicheMatchLower(): string[] {
   const out: string[] = [];
-  for (const g of PREFERRED_GENRES) {
-    const aliases = CATEGORY_ALIASES[g];
+  for (const g of NICHE_TAGS) {
+    const aliases = TAG_ALIASES[g];
     if (aliases) {
       for (const a of aliases) out.push(a.toLowerCase());
     } else {
@@ -111,15 +115,9 @@ function matchTagsLower(): string[] {
   return out;
 }
 
-/** Pref order keys = display names (canonical), lowercase. */
-function displayPrefLower(): string[] {
-  return PREFERRED_GENRES.map((g) => g.toLowerCase());
-}
-
-/** Flatten alias map to [aliasLower, displayName] pairs for SQL VALUES. */
 function aliasPairs(): [string, string][] {
   const pairs: [string, string][] = [];
-  for (const [display, aliases] of Object.entries(CATEGORY_ALIASES)) {
+  for (const [display, aliases] of Object.entries(TAG_ALIASES)) {
     for (const a of aliases) {
       pairs.push([a.toLowerCase(), display]);
     }
@@ -145,6 +143,7 @@ function mapCategories(rows: CategoryRow[]) {
     tag_name: c.tag_name,
     num_games: Number(c.num_games),
     avg_ccu: Number(c.avg_ccu) || 0,
+    source: c.source,
   }));
 }
 
@@ -169,31 +168,58 @@ function groupByTag(categories: CategoryRow[], ranked: GameRow[]) {
   return byTag;
 }
 
+function pickTopCategories(
+  rows: CategoryRow[],
+  limit: number,
+  minGames: number,
+): CategoryRow[] {
+  const pref = new Map(
+    DISPLAY_ORDER.map((name, i) => [name.toLowerCase(), i]),
+  );
+  return [...rows]
+    .filter((r) => Number(r.num_games) >= minGames)
+    .sort((a, b) => {
+      const pa = pref.get(a.tag_name.toLowerCase()) ?? 999;
+      const pb = pref.get(b.tag_name.toLowerCase()) ?? 999;
+      if (pa !== pb) return pa - pb;
+      return (Number(b.avg_ccu) || 0) - (Number(a.avg_ccu) || 0);
+    })
+    .slice(0, limit);
+}
+
 export async function GET() {
   try {
-    const tagsLower = matchTagsLower();
-    const prefLower = displayPrefLower();
+    const officialLower = OFFICIAL_GENRES.map((g) => g.toLowerCase());
+    const nicheLower = nicheMatchLower();
     const pairs = aliasPairs();
     const aliasFlat = pairs.flat();
     const denyToolTags = toolTagsLower();
     const denyAppIds = [...NON_GAME_APP_IDS];
 
-    // Param layout:
-    // $1 = pref/display names, $2 = match tags, then alias pairs,
-    // then tool-tag denylist, then non-game app ids
-    const toolParamIdx = 3 + pairs.length * 2;
-    const appIdsParamIdx = toolParamIdx + 1;
-    const toolParam = `$${toolParamIdx}`;
-    const appIdsParam = `$${appIdsParamIdx}`;
     const realGame = isRealGameSql({
-      toolTagsParam: toolParam,
-      appIdsParam,
+      toolTagsParam: "$2",
+      appIdsParam: "$3",
     });
-    const filterParams = [denyToolTags, denyAppIds] as const;
-    const catParams = [prefLower, tagsLower, ...aliasFlat, ...filterParams];
+    const genreCatParams = [officialLower, denyToolTags, denyAppIds] as const;
+
+    // Niche tags: $1=pref display order keys, $2=match tags, aliases…, filters
+    const nicheToolIdx = 3 + pairs.length * 2;
+    const nicheAppIdx = nicheToolIdx + 1;
+    const nicheRealGame = isRealGameSql({
+      toolTagsParam: `$${nicheToolIdx}`,
+      appIdsParam: `$${nicheAppIdx}`,
+    });
+    const nichePrefLower = NICHE_TAGS.map((g) => g.toLowerCase());
+    const nicheCatParams = [
+      nichePrefLower,
+      nicheLower,
+      ...aliasFlat,
+      denyToolTags,
+      denyAppIds,
+    ];
     const aliasSql = aliasValuesClause(3, pairs);
 
-    const preferredCte = `
+    const preferredNicheCte = `
       alias_map AS (
         SELECT * FROM ${aliasSql}
       ),
@@ -212,88 +238,213 @@ export async function GET() {
       )
     `;
 
-    const categories = await query<CategoryRow>(
-      `
-      WITH latest_ccu AS (
-        SELECT DISTINCT ON (app_id)
-          app_id, concurrent_players
-        FROM player_counts
-        ORDER BY app_id, snapshot_time DESC
-      ),
-      ${preferredCte},
-      uniq AS (
-        SELECT DISTINCT ON (p.tag_name, gt.app_id)
-          p.tag_id,
-          p.tag_name,
-          p.pref,
-          gt.app_id,
-          lc.concurrent_players
-        FROM preferred p
-        JOIN game_tags gt ON gt.tag_id = p.tag_id
-        JOIN games g ON g.app_id = gt.app_id
-        JOIN latest_ccu lc ON lc.app_id = g.app_id
-        WHERE ${realGame}
-        ORDER BY p.tag_name, gt.app_id, lc.concurrent_players DESC NULLS LAST
-      )
-      SELECT
-        MIN(u.tag_id) AS tag_id,
-        u.tag_name,
-        COUNT(*)::text AS num_games,
-        ROUND(AVG(u.concurrent_players), 1)::text AS avg_ccu
-      FROM uniq u
-      GROUP BY u.tag_name, u.pref
-      HAVING COUNT(*) >= 8
-      ORDER BY u.pref NULLS LAST, AVG(u.concurrent_players) DESC NULLS LAST
-      LIMIT 16
-      `,
-      catParams,
-    );
+    const [genreCats, nicheCats, genreFreeCats, nicheFreeCats] =
+      await Promise.all([
+        query<CategoryRow>(
+          `
+          WITH latest_ccu AS (
+            SELECT DISTINCT ON (app_id)
+              app_id, concurrent_players
+            FROM player_counts
+            ORDER BY app_id, snapshot_time DESC
+          ),
+          preferred AS (
+            SELECT
+              gen.genre_id AS tag_id,
+              gen.genre_name AS tag_name,
+              (
+                SELECT MIN(ord)
+                FROM unnest($1::text[]) WITH ORDINALITY AS u(name, ord)
+                WHERE u.name = LOWER(gen.genre_name)
+              ) AS pref
+            FROM genres gen
+            WHERE LOWER(gen.genre_name) = ANY($1::text[])
+          ),
+          uniq AS (
+            SELECT DISTINCT ON (p.tag_name, gg.app_id)
+              p.tag_id,
+              p.tag_name,
+              p.pref,
+              gg.app_id,
+              lc.concurrent_players
+            FROM preferred p
+            JOIN game_genres gg ON gg.genre_id = p.tag_id
+            JOIN games g ON g.app_id = gg.app_id
+            JOIN latest_ccu lc ON lc.app_id = g.app_id
+            WHERE ${realGame}
+            ORDER BY p.tag_name, gg.app_id, lc.concurrent_players DESC NULLS LAST
+          )
+          SELECT
+            MIN(u.tag_id) AS tag_id,
+            u.tag_name,
+            COUNT(*)::text AS num_games,
+            ROUND(AVG(u.concurrent_players), 1)::text AS avg_ccu,
+            'genre'::text AS source
+          FROM uniq u
+          GROUP BY u.tag_name, u.pref
+          ORDER BY u.pref NULLS LAST, AVG(u.concurrent_players) DESC NULLS LAST
+          `,
+          [...genreCatParams],
+        ),
+        query<CategoryRow>(
+          `
+          WITH latest_ccu AS (
+            SELECT DISTINCT ON (app_id)
+              app_id, concurrent_players
+            FROM player_counts
+            ORDER BY app_id, snapshot_time DESC
+          ),
+          ${preferredNicheCte},
+          uniq AS (
+            SELECT DISTINCT ON (p.tag_name, gt.app_id)
+              p.tag_id,
+              p.tag_name,
+              p.pref,
+              gt.app_id,
+              lc.concurrent_players
+            FROM preferred p
+            JOIN game_tags gt ON gt.tag_id = p.tag_id
+            JOIN games g ON g.app_id = gt.app_id
+            JOIN latest_ccu lc ON lc.app_id = g.app_id
+            WHERE ${nicheRealGame}
+            ORDER BY p.tag_name, gt.app_id, lc.concurrent_players DESC NULLS LAST
+          )
+          SELECT
+            MIN(u.tag_id) AS tag_id,
+            u.tag_name,
+            COUNT(*)::text AS num_games,
+            ROUND(AVG(u.concurrent_players), 1)::text AS avg_ccu,
+            'tag'::text AS source
+          FROM uniq u
+          GROUP BY u.tag_name, u.pref
+          ORDER BY u.pref NULLS LAST, AVG(u.concurrent_players) DESC NULLS LAST
+          `,
+          nicheCatParams,
+        ),
+        query<CategoryRow>(
+          `
+          WITH latest_ccu AS (
+            SELECT DISTINCT ON (app_id)
+              app_id, concurrent_players
+            FROM player_counts
+            ORDER BY app_id, snapshot_time DESC
+          ),
+          preferred AS (
+            SELECT
+              gen.genre_id AS tag_id,
+              gen.genre_name AS tag_name
+            FROM genres gen
+            WHERE LOWER(gen.genre_name) = ANY($1::text[])
+          ),
+          uniq AS (
+            SELECT DISTINCT ON (p.tag_name, gg.app_id)
+              p.tag_id,
+              p.tag_name,
+              gg.app_id,
+              lc.concurrent_players
+            FROM preferred p
+            JOIN game_genres gg ON gg.genre_id = p.tag_id
+            JOIN games g ON g.app_id = gg.app_id
+            JOIN latest_ccu lc ON lc.app_id = g.app_id
+            WHERE ${IS_FREE_SQL}
+              AND ${realGame}
+            ORDER BY p.tag_name, gg.app_id, lc.concurrent_players DESC NULLS LAST
+          )
+          SELECT
+            MIN(u.tag_id) AS tag_id,
+            u.tag_name,
+            COUNT(*)::text AS num_games,
+            ROUND(AVG(u.concurrent_players), 1)::text AS avg_ccu,
+            'genre'::text AS source
+          FROM uniq u
+          GROUP BY u.tag_name
+          ORDER BY AVG(u.concurrent_players) DESC NULLS LAST
+          `,
+          [...genreCatParams],
+        ),
+        query<CategoryRow>(
+          `
+          WITH latest_ccu AS (
+            SELECT DISTINCT ON (app_id)
+              app_id, concurrent_players
+            FROM player_counts
+            ORDER BY app_id, snapshot_time DESC
+          ),
+          ${preferredNicheCte},
+          uniq AS (
+            SELECT DISTINCT ON (p.tag_name, gt.app_id)
+              p.tag_id,
+              p.tag_name,
+              gt.app_id,
+              lc.concurrent_players
+            FROM preferred p
+            JOIN game_tags gt ON gt.tag_id = p.tag_id
+            JOIN games g ON g.app_id = gt.app_id
+            JOIN latest_ccu lc ON lc.app_id = g.app_id
+            WHERE ${IS_FREE_SQL}
+              AND ${nicheRealGame}
+            ORDER BY p.tag_name, gt.app_id, lc.concurrent_players DESC NULLS LAST
+          )
+          SELECT
+            MIN(u.tag_id) AS tag_id,
+            u.tag_name,
+            COUNT(*)::text AS num_games,
+            ROUND(AVG(u.concurrent_players), 1)::text AS avg_ccu,
+            'tag'::text AS source
+          FROM uniq u
+          GROUP BY u.tag_name
+          ORDER BY AVG(u.concurrent_players) DESC NULLS LAST
+          `,
+          nicheCatParams,
+        ),
+      ]);
 
-    const freeCategories = await query<CategoryRow>(
-      `
-      WITH latest_ccu AS (
-        SELECT DISTINCT ON (app_id)
-          app_id, concurrent_players
-        FROM player_counts
-        ORDER BY app_id, snapshot_time DESC
-      ),
-      ${preferredCte},
-      uniq AS (
-        SELECT DISTINCT ON (p.tag_name, gt.app_id)
-          p.tag_id,
-          p.tag_name,
-          p.pref,
-          gt.app_id,
-          lc.concurrent_players
-        FROM preferred p
-        JOIN game_tags gt ON gt.tag_id = p.tag_id
-        JOIN games g ON g.app_id = gt.app_id
-        JOIN latest_ccu lc ON lc.app_id = g.app_id
-        WHERE ${IS_FREE_SQL}
-          AND ${realGame}
-        ORDER BY p.tag_name, gt.app_id, lc.concurrent_players DESC NULLS LAST
-      )
-      SELECT
-        MIN(u.tag_id) AS tag_id,
-        u.tag_name,
-        COUNT(*)::text AS num_games,
-        ROUND(AVG(u.concurrent_players), 1)::text AS avg_ccu
-      FROM uniq u
-      GROUP BY u.tag_name, u.pref
-      HAVING COUNT(*) >= 5
-      ORDER BY AVG(u.concurrent_players) DESC NULLS LAST, u.pref NULLS LAST
-      LIMIT 8
-      `,
-      catParams,
-    );
+    // Prefer official genres; fill remaining slots with niche tags.
+    // Genre min can be lower while catalog is still filling from SteamSpy.
+    const categories = [
+      ...pickTopCategories(genreCats, 10, 3),
+      ...pickTopCategories(nicheCats, 16, 8),
+    ].slice(0, 16);
+
+    const freeCategories = [
+      ...pickTopCategories(genreFreeCats, 5, 2),
+      ...pickTopCategories(nicheFreeCats, 8, 5),
+    ].slice(0, 8);
 
     const categoryNames = categories.map((c) => c.tag_name);
     const freeCategoryNames = freeCategories.map((c) => c.tag_name);
+    const genreDisplayNames = new Set(
+      categories.filter((c) => c.source === "genre").map((c) => c.tag_name),
+    );
+    const freeGenreDisplayNames = new Set(
+      freeCategories.filter((c) => c.source === "genre").map((c) => c.tag_name),
+    );
 
-    // Ranked queries: $1 = display names, $2 = match tags, then alias pairs, filters
+    const rankedGenreNames = categoryNames.filter((n) =>
+      genreDisplayNames.has(n),
+    );
+    const rankedNicheNames = categoryNames.filter(
+      (n) => !genreDisplayNames.has(n),
+    );
+    const rankedFreeGenreNames = freeCategoryNames.filter((n) =>
+      freeGenreDisplayNames.has(n),
+    );
+    const rankedFreeNicheNames = freeCategoryNames.filter(
+      (n) => !freeGenreDisplayNames.has(n),
+    );
+
+    const rankedGenreReal = isRealGameSql({
+      toolTagsParam: "$2",
+      appIdsParam: "$3",
+    });
+    const rankedNicheToolIdx = 3 + pairs.length * 2;
+    const rankedNicheAppIdx = rankedNicheToolIdx + 1;
+    const rankedNicheReal = isRealGameSql({
+      toolTagsParam: `$${rankedNicheToolIdx}`,
+      appIdsParam: `$${rankedNicheAppIdx}`,
+    });
     const rankedAliasSql = aliasValuesClause(3, pairs);
-
-    const rankedPreferredCte = `
+    const rankedNichePreferredCte = `
       alias_map AS (
         SELECT * FROM ${rankedAliasSql}
       ),
@@ -307,124 +458,9 @@ export async function GET() {
       )
     `;
 
-    const rankedParams = (names: string[]) => [
-      names,
-      tagsLower,
-      ...aliasFlat,
-      ...filterParams,
-    ];
-
-    const [ranked, rankedFree, topFree] = await Promise.all([
-      categoryNames.length === 0
-        ? Promise.resolve([] as GameRow[])
-        : query<GameRow>(
-            `
-            WITH latest_ccu AS (
-              SELECT DISTINCT ON (app_id)
-                app_id, concurrent_players, owners_estimate
-              FROM player_counts
-              ORDER BY app_id, snapshot_time DESC
-            ),
-            ${rankedPreferredCte},
-            deduped AS (
-              SELECT DISTINCT ON (p.tag_name, g.app_id)
-                p.tag_name,
-                g.app_id,
-                g.name,
-                COALESCE(lc.concurrent_players, 0) AS concurrent_players,
-                COALESCE(lc.owners_estimate, '0') AS owners_estimate,
-                (${IS_FREE_SQL}) AS is_free
-              FROM preferred p
-              JOIN game_tags gt ON gt.tag_id = p.tag_id
-              JOIN games g ON g.app_id = gt.app_id
-              LEFT JOIN latest_ccu lc ON lc.app_id = g.app_id
-              WHERE p.tag_name = ANY($1::text[])
-                AND ${realGame}
-              ORDER BY
-                p.tag_name,
-                g.app_id,
-                COALESCE(lc.concurrent_players, 0) DESC
-            ),
-            ranked AS (
-              SELECT
-                tag_name,
-                app_id,
-                name,
-                concurrent_players,
-                owners_estimate,
-                is_free,
-                ROW_NUMBER() OVER (
-                  PARTITION BY tag_name
-                  ORDER BY concurrent_players DESC NULLS LAST, name
-                ) AS rn
-              FROM deduped
-            )
-            SELECT tag_name, app_id, name, concurrent_players, owners_estimate, is_free, rn
-            FROM ranked
-            WHERE rn <= 10
-            ORDER BY tag_name, rn
-            `,
-            rankedParams(categoryNames),
-          ),
-      freeCategoryNames.length === 0
-        ? Promise.resolve([] as GameRow[])
-        : query<GameRow>(
-            `
-            WITH latest_ccu AS (
-              SELECT DISTINCT ON (app_id)
-                app_id, concurrent_players, owners_estimate
-              FROM player_counts
-              ORDER BY app_id, snapshot_time DESC
-            ),
-            ${rankedPreferredCte},
-            deduped AS (
-              SELECT DISTINCT ON (p.tag_name, g.app_id)
-                p.tag_name,
-                g.app_id,
-                g.name,
-                COALESCE(lc.concurrent_players, 0) AS concurrent_players,
-                COALESCE(lc.owners_estimate, '0') AS owners_estimate,
-                TRUE AS is_free
-              FROM preferred p
-              JOIN game_tags gt ON gt.tag_id = p.tag_id
-              JOIN games g ON g.app_id = gt.app_id
-              LEFT JOIN latest_ccu lc ON lc.app_id = g.app_id
-              WHERE p.tag_name = ANY($1::text[])
-                AND ${IS_FREE_SQL}
-                AND ${realGame}
-              ORDER BY
-                p.tag_name,
-                g.app_id,
-                COALESCE(lc.concurrent_players, 0) DESC
-            ),
-            ranked AS (
-              SELECT
-                tag_name,
-                app_id,
-                name,
-                concurrent_players,
-                owners_estimate,
-                is_free,
-                ROW_NUMBER() OVER (
-                  PARTITION BY tag_name
-                  ORDER BY concurrent_players DESC NULLS LAST, name
-                ) AS rn
-              FROM deduped
-            )
-            SELECT tag_name, app_id, name, concurrent_players, owners_estimate, is_free, rn
-            FROM ranked
-            WHERE rn <= 10
-            ORDER BY tag_name, rn
-            `,
-            rankedParams(freeCategoryNames),
-          ),
-      query<{
-        app_id: number;
-        name: string;
-        concurrent_players: number;
-        owners_estimate: string;
-        rn: number | string;
-      }>(
+    async function rankedByGenre(names: string[], freeOnly: boolean) {
+      if (names.length === 0) return [] as GameRow[];
+      return query<GameRow>(
         `
         WITH latest_ccu AS (
           SELECT DISTINCT ON (app_id)
@@ -432,28 +468,138 @@ export async function GET() {
           FROM player_counts
           ORDER BY app_id, snapshot_time DESC
         ),
-        ranked AS (
-          SELECT
+        preferred AS (
+          SELECT gen.genre_id AS tag_id, gen.genre_name AS tag_name
+          FROM genres gen
+          WHERE gen.genre_name = ANY($1::text[])
+        ),
+        deduped AS (
+          SELECT DISTINCT ON (p.tag_name, g.app_id)
+            p.tag_name,
             g.app_id,
             g.name,
             COALESCE(lc.concurrent_players, 0) AS concurrent_players,
             COALESCE(lc.owners_estimate, '0') AS owners_estimate,
-            ROW_NUMBER() OVER (
-              ORDER BY lc.concurrent_players DESC NULLS LAST, g.name
-            ) AS rn
-          FROM games g
+            (${IS_FREE_SQL}) AS is_free
+          FROM preferred p
+          JOIN game_genres gg ON gg.genre_id = p.tag_id
+          JOIN games g ON g.app_id = gg.app_id
           LEFT JOIN latest_ccu lc ON lc.app_id = g.app_id
-          WHERE ${IS_FREE_SQL}
-            AND ${isRealGameSql({ toolTagsParam: "$1", appIdsParam: "$2" })}
+          WHERE ${freeOnly ? `${IS_FREE_SQL} AND` : ""} ${rankedGenreReal}
+          ORDER BY
+            p.tag_name,
+            g.app_id,
+            COALESCE(lc.concurrent_players, 0) DESC
+        ),
+        ranked AS (
+          SELECT
+            tag_name, app_id, name, concurrent_players, owners_estimate, is_free,
+            ROW_NUMBER() OVER (
+              PARTITION BY tag_name
+              ORDER BY concurrent_players DESC NULLS LAST, name
+            ) AS rn
+          FROM deduped
         )
-        SELECT app_id, name, concurrent_players, owners_estimate, rn
+        SELECT tag_name, app_id, name, concurrent_players, owners_estimate, is_free, rn
         FROM ranked
         WHERE rn <= 10
-        ORDER BY rn
+        ORDER BY tag_name, rn
         `,
-        [denyToolTags, denyAppIds],
-      ),
-    ]);
+        [names, denyToolTags, denyAppIds],
+      );
+    }
+
+    async function rankedByNiche(names: string[], freeOnly: boolean) {
+      if (names.length === 0) return [] as GameRow[];
+      return query<GameRow>(
+        `
+        WITH latest_ccu AS (
+          SELECT DISTINCT ON (app_id)
+            app_id, concurrent_players, owners_estimate
+          FROM player_counts
+          ORDER BY app_id, snapshot_time DESC
+        ),
+        ${rankedNichePreferredCte},
+        deduped AS (
+          SELECT DISTINCT ON (p.tag_name, g.app_id)
+            p.tag_name,
+            g.app_id,
+            g.name,
+            COALESCE(lc.concurrent_players, 0) AS concurrent_players,
+            COALESCE(lc.owners_estimate, '0') AS owners_estimate,
+            (${IS_FREE_SQL}) AS is_free
+          FROM preferred p
+          JOIN game_tags gt ON gt.tag_id = p.tag_id
+          JOIN games g ON g.app_id = gt.app_id
+          LEFT JOIN latest_ccu lc ON lc.app_id = g.app_id
+          WHERE p.tag_name = ANY($1::text[])
+            ${freeOnly ? `AND ${IS_FREE_SQL}` : ""}
+            AND ${rankedNicheReal}
+          ORDER BY
+            p.tag_name,
+            g.app_id,
+            COALESCE(lc.concurrent_players, 0) DESC
+        ),
+        ranked AS (
+          SELECT
+            tag_name, app_id, name, concurrent_players, owners_estimate, is_free,
+            ROW_NUMBER() OVER (
+              PARTITION BY tag_name
+              ORDER BY concurrent_players DESC NULLS LAST, name
+            ) AS rn
+          FROM deduped
+        )
+        SELECT tag_name, app_id, name, concurrent_players, owners_estimate, is_free, rn
+        FROM ranked
+        WHERE rn <= 10
+        ORDER BY tag_name, rn
+        `,
+        [names, nicheLower, ...aliasFlat, denyToolTags, denyAppIds],
+      );
+    }
+
+    const [rankedG, rankedN, rankedFreeG, rankedFreeN, topFree] =
+      await Promise.all([
+        rankedByGenre(rankedGenreNames, false),
+        rankedByNiche(rankedNicheNames, false),
+        rankedByGenre(rankedFreeGenreNames, true),
+        rankedByNiche(rankedFreeNicheNames, true),
+        query<{
+          app_id: number;
+          name: string;
+          concurrent_players: number;
+          owners_estimate: string;
+          rn: number | string;
+        }>(
+          `
+          WITH latest_ccu AS (
+            SELECT DISTINCT ON (app_id)
+              app_id, concurrent_players, owners_estimate
+            FROM player_counts
+            ORDER BY app_id, snapshot_time DESC
+          ),
+          ranked AS (
+            SELECT
+              g.app_id,
+              g.name,
+              COALESCE(lc.concurrent_players, 0) AS concurrent_players,
+              COALESCE(lc.owners_estimate, '0') AS owners_estimate,
+              ROW_NUMBER() OVER (
+                ORDER BY lc.concurrent_players DESC NULLS LAST, g.name
+              ) AS rn
+            FROM games g
+            LEFT JOIN latest_ccu lc ON lc.app_id = g.app_id
+            WHERE ${IS_FREE_SQL}
+              AND ${isRealGameSql({ toolTagsParam: "$1", appIdsParam: "$2" })}
+          )
+          SELECT app_id, name, concurrent_players, owners_estimate, rn
+          FROM ranked
+          WHERE rn <= 10
+          ORDER BY rn
+          `,
+          [denyToolTags, denyAppIds],
+        ),
+      ]);
 
     const topFreeMapped = topFree
       .map((g) => ({
@@ -469,10 +615,19 @@ export async function GET() {
     return NextResponse.json(
       {
         categories: mapCategories(categories),
-        byTag: groupByTag(categories, ranked),
+        byTag: groupByTag(categories, [...rankedG, ...rankedN]),
         freeCategories: mapCategories(freeCategories),
-        byTagFree: groupByTag(freeCategories, rankedFree),
+        byTagFree: groupByTag(freeCategories, [
+          ...rankedFreeG,
+          ...rankedFreeN,
+        ]),
         topFree: topFreeMapped,
+        meta: {
+          // ponytail: multi-genre membership (game in each SteamSpy genre listed)
+          membership: "multi",
+          official_genres: OFFICIAL_GENRES,
+          niche_tags: NICHE_TAGS,
+        },
       },
       {
         headers: {

@@ -500,7 +500,9 @@ export default function HomePage() {
       <div className="panel framed">
         <div className="panel-head">
           <h2>Top 10 by genre</h2>
-          <span className="status">Ranked by players online</span>
+          <span className="status">
+            SteamSpy genres + niche tags · ranked by players online
+          </span>
         </div>
         {cats?.error && <p className="error">{cats.error}</p>}
         {!cats && <p className="muted">Loading categories…</p>}
