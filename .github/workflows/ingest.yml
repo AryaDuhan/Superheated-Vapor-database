@@ -1,0 +1,25 @@
+name: Daily SteamSpy Ingest
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Fetch SteamSpy snapshot
+        run: python data/fetch_steamspy.py
+      - name: Load into Neon (player_counts + SCD2 prices)
+        run: python load_snapshot.py
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
