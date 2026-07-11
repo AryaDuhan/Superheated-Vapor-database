@@ -11,7 +11,7 @@ import { FREE_DEFINITION, IS_FREE_SQL } from "@/lib/isFree";
 
 export const runtime = "nodejs";
 
-const MAJOR_GENRES = [
+const OFFICIAL_MAJOR_GENRES = [
   "Action",
   "Adventure",
   "RPG",
@@ -21,6 +21,10 @@ const MAJOR_GENRES = [
   "Casual",
   "Sports",
   "Racing",
+] as const;
+
+/** Niches tracked as Steam tags (not SteamSpy store genres). */
+const NICHE_MAJOR_GENRES = [
   "Horror",
   "Shooter",
   "Multiplayer",
@@ -28,6 +32,8 @@ const MAJOR_GENRES = [
   "Puzzle",
   "Platformer",
 ] as const;
+
+const MAJOR_GENRES = [...OFFICIAL_MAJOR_GENRES, ...NICHE_MAJOR_GENRES] as const;
 
 type GameRow = {
   app_id: number;
@@ -205,18 +211,37 @@ export async function GET() {
           ORDER BY app_id, snapshot_time DESC
         ),
         tagged AS (
-          SELECT DISTINCT ON (t.tag_name, g.app_id)
-            t.tag_name,
-            g.app_id,
-            (${IS_FREE_SQL}) AS is_free,
-            COALESCE(lc.concurrent_players, 0) AS ccu
-          FROM tags t
-          JOIN game_tags gt ON gt.tag_id = t.tag_id
-          JOIN games g ON g.app_id = gt.app_id
-          LEFT JOIN latest_ccu lc ON lc.app_id = g.app_id
-          WHERE LOWER(t.tag_name) = ANY($1::text[])
-            AND ${realGameP23}
-          ORDER BY t.tag_name, g.app_id
+          SELECT DISTINCT ON (label, app_id)
+            label AS tag_name,
+            app_id,
+            is_free,
+            ccu
+          FROM (
+            SELECT
+              gen.genre_name AS label,
+              g.app_id,
+              (${IS_FREE_SQL}) AS is_free,
+              COALESCE(lc.concurrent_players, 0) AS ccu
+            FROM genres gen
+            JOIN game_genres gg ON gg.genre_id = gen.genre_id
+            JOIN games g ON g.app_id = gg.app_id
+            LEFT JOIN latest_ccu lc ON lc.app_id = g.app_id
+            WHERE LOWER(gen.genre_name) = ANY($1::text[])
+              AND ${realGameP23}
+            UNION ALL
+            SELECT
+              t.tag_name AS label,
+              g.app_id,
+              (${IS_FREE_SQL}) AS is_free,
+              COALESCE(lc.concurrent_players, 0) AS ccu
+            FROM tags t
+            JOIN game_tags gt ON gt.tag_id = t.tag_id
+            JOIN games g ON g.app_id = gt.app_id
+            LEFT JOIN latest_ccu lc ON lc.app_id = g.app_id
+            WHERE LOWER(t.tag_name) = ANY($4::text[])
+              AND ${realGameP23}
+          ) u
+          ORDER BY label, app_id
         )
         SELECT
           tag_name,
@@ -230,7 +255,12 @@ export async function GET() {
         ORDER BY SUM(ccu) DESC NULLS LAST
         LIMIT 12
         `,
-        [genreList, denyToolTags, denyAppIds],
+        [
+          OFFICIAL_MAJOR_GENRES.map((g) => g.toLowerCase()),
+          denyToolTags,
+          denyAppIds,
+          NICHE_MAJOR_GENRES.map((g) => g.toLowerCase()),
+        ],
       ),
 
       query<{

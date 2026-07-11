@@ -98,14 +98,29 @@ def mark_done(app_id: int):
         f.write(f"{app_id}\n")
 
 
-def fetch_and_insert(conn, app_ids: list[int], sleep_s: float = 1.0):
+def fetch_and_insert(
+    conn,
+    app_ids: list[int],
+    sleep_s: float = 1.0,
+    workers: int = 1,
+):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
     done = load_done()
     todo = [a for a in app_ids if a not in done]
-    print(f"SteamSpy fetch: {len(todo)} apps need genre (skipping {len(done)} already attempted)")
+    print(
+        f"SteamSpy fetch: {len(todo)} apps need genre "
+        f"(skipping {len(done)} already attempted, workers={workers})"
+    )
     ok = 0
     empty = 0
     err = 0
-    for i, app_id in enumerate(todo, 1):
+    lock = threading.Lock()
+    progress_lock = threading.Lock()
+
+    def one(app_id: int):
+        nonlocal ok, empty, err
         try:
             r = requests.get(
                 STEAMSPY_URL.format(app_id=app_id),
@@ -115,25 +130,50 @@ def fetch_and_insert(conn, app_ids: list[int], sleep_s: float = 1.0):
             r.raise_for_status()
             data = r.json()
             genre = data.get("genre") if isinstance(data, dict) else None
-            with conn.cursor() as cur:
-                # Ensure game row exists (it should)
-                cur.execute("SELECT 1 FROM games WHERE app_id = %s", (app_id,))
-                if cur.fetchone():
-                    upsert_game_genres(cur, app_id, genre)
-            conn.commit()
-            if parse_genres(genre):
-                ok += 1
-            else:
-                empty += 1
-            mark_done(app_id)
+            with lock:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1 FROM games WHERE app_id = %s", (app_id,))
+                    if cur.fetchone():
+                        upsert_game_genres(cur, app_id, genre)
+                conn.commit()
+            with progress_lock:
+                if parse_genres(genre):
+                    ok += 1
+                else:
+                    empty += 1
+                mark_done(app_id)
+                return True
         except Exception as e:
-            conn.rollback()
-            err += 1
+            with lock:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            with progress_lock:
+                err += 1
+                mark_done(app_id)
             print(f"  [{app_id}] error: {e}")
-            mark_done(app_id)  # don't hammer forever on hard failures
-        if i % 25 == 0 or i == len(todo):
-            print(f"  [{i}/{len(todo)}] ok={ok} empty={empty} err={err}")
-        time.sleep(sleep_s)
+            return False
+
+    if workers <= 1:
+        for i, app_id in enumerate(todo, 1):
+            one(app_id)
+            if i % 25 == 0 or i == len(todo):
+                print(f"  [{i}/{len(todo)}] ok={ok} empty={empty} err={err}")
+            time.sleep(sleep_s)
+    else:
+        # ponytail: small pool; SteamSpy soft-rate-limits — bump workers only if empty/err stay low
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = []
+            for i, app_id in enumerate(todo, 1):
+                futs.append(pool.submit(one, app_id))
+                time.sleep(sleep_s)
+                if i % 25 == 0:
+                    print(f"  queued {i}/{len(todo)} ok={ok} empty={empty} err={err}")
+            for fut in as_completed(futs):
+                fut.result()
+        print(f"  final ok={ok} empty={empty} err={err}")
+
     print(f"SteamSpy done: ok={ok} empty={empty} err={err}")
 
 
@@ -175,6 +215,12 @@ def main():
         help="Fetch missing genres from SteamSpy (~1 req/s)",
     )
     p.add_argument("--sleep", type=float, default=1.0)
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Concurrent SteamSpy fetches (keep low; default 1)",
+    )
     args = p.parse_args()
 
     conn = connect()
@@ -184,7 +230,9 @@ def main():
         if args.fetch and not args.json_only:
             missing = missing_app_ids(conn)
             if missing:
-                fetch_and_insert(conn, missing, sleep_s=args.sleep)
+                fetch_and_insert(
+                    conn, missing, sleep_s=args.sleep, workers=args.workers
+                )
             else:
                 print("No games missing genres")
         elif not args.json_only and not args.fetch:
@@ -192,7 +240,9 @@ def main():
             missing = missing_app_ids(conn)
             if missing:
                 print(f"{len(missing)} games still missing genres — fetching SteamSpy…")
-                fetch_and_insert(conn, missing, sleep_s=args.sleep)
+                fetch_and_insert(
+                    conn, missing, sleep_s=args.sleep, workers=args.workers
+                )
         print_stats(conn)
     finally:
         conn.close()
