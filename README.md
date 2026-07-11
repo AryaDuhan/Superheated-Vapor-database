@@ -1,6 +1,6 @@
 # Superheated Vapor database
 
-Steam analytics warehouse on **Neon Postgres** plus a **STEAMFORGE** Next.js dashboard. The warehouse stores SteamSpy market snapshots, SCD Type 2 price history (USD / INR), tags, genres, player counts, and review embeddings for semantic search. The dashboard queries that data for charts, community sentiment, tag gaps, and MiniLM + pgvector review search.
+**Steam SQL analytics** — a Neon Postgres warehouse of SteamSpy market data and Steam reviews, plus **STEAMFORGE**, a Next.js dashboard for free-vs-paid CCU, busy niches, INR pricing, and MiniLM + pgvector semantic review search.
 
 **GitHub:** [AryaDuhan/Superheated-Vapor-database](https://github.com/AryaDuhan/Superheated-Vapor-database)
 
@@ -158,9 +158,35 @@ Nav: **Store · Top · Analysis · Community · Tags · Stats**, plus header gam
 
 **INR:** live India store prices come from `load_inr_prices.py` (`appdetails?cc=in`) into SCD2 `price_history` with `currency_code = 'INR'`. Top and game detail show INR beside USD when present.
 
-**Genres & tags:** SteamSpy store genres (`genres` / `game_genres`) plus Steam tags. Analysis majors include official genres (Action, RPG, …) and niches (Horror, Shooter, Survival, …). Non-game/tool apps are filtered out of “real game” rankings.
+**Genres & tags:** SteamSpy store genres (`genres` / `game_genres`) plus Steam tags. Analysis majors include official genres (Action, RPG, …) and niches (Horror, Shooter, Survival, …).
+
+**Tag pollution filters:** Rankings and busy-niche views exclude software/tools (Wallpaper Engine, SDKs, Utilities, …), known non-game app ids, and junk/adult niche tags. Logic lives in `dashboard/src/lib/gameFilters.ts` and mirrors the denylists in `analysis/03_tag_gap_analysis.sql`.
 
 API Route Handlers under `dashboard/src/app/api/` talk to Neon via `lib/db.ts`. Search uses `lib/embed.ts` then cosine distance on `halfvec`.
+
+---
+
+## Schema overview
+
+Defined in `sql/schema.sql` (plus `sql/10_genres.sql` / `sql/04_scd2_upsert_price.sql`).
+
+| Table | Role |
+| --- | --- |
+| `developers` | Studios; optional `parent_dev_id` for publisher trees (Stats page). |
+| `games` | Steam `app_id`, name, description, release date, developer FK, `base_price_usd`. |
+| `tags` / `game_tags` | Steam user tags (many-to-many). |
+| `genres` / `game_genres` | SteamSpy store genres (many-to-many). |
+| `price_history` | SCD Type 2 prices per `currency_code` (USD, INR, …): `valid_from` / `valid_to` / `is_current`, discount %. Written via `upsert_price()`. |
+| `player_counts` | Snapshot rows: CCU + SteamSpy `owners_estimate` keyed by `(app_id, snapshot_time)`. |
+| `reviews` | Steam reviews: text, time, `is_positive`, playtime at review, **`review_embedding halfvec(384)`** (MiniLM) with HNSW cosine index. |
+
+```
+developers ──< games >── game_tags >── tags
+                │    >── game_genres >── genres
+                ├── price_history
+                ├── player_counts
+                └── reviews (embeddings)
+```
 
 ---
 
