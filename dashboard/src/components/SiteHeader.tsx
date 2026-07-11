@@ -127,7 +127,7 @@ export function SiteHeader() {
         <Link href="/" className="brand" onMouseEnter={() => warmFor("/")}>
           Steamforge
         </Link>
-        <p className="brand-sub">// Analytics</p>
+        <p className="brand-sub">{"// Analytics"}</p>
       </div>
       <nav className="nav">
         {LINKS.map((l) => (

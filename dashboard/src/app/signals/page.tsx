@@ -103,7 +103,7 @@ export default function SignalsPage() {
                       >
                         {slug(b.name)}
                       </Link>{" "}
-                      // Neg_Spike
+                      {"// Neg_Spike"}
                     </p>
                     <p className="feed-meta">
                       z {b.z_score} · neg {formatCount(b.negative_count)} /{" "}
