@@ -400,14 +400,13 @@ export async function GET() {
       ]);
 
     // Prefer official genres; fill remaining slots with niche tags.
-    // Genre min can be lower while catalog is still filling from SteamSpy.
     const categories = [
-      ...pickTopCategories(genreCats, 10, 3),
+      ...pickTopCategories(genreCats, 10, 8),
       ...pickTopCategories(nicheCats, 16, 8),
     ].slice(0, 16);
 
     const freeCategories = [
-      ...pickTopCategories(genreFreeCats, 5, 2),
+      ...pickTopCategories(genreFreeCats, 5, 5),
       ...pickTopCategories(nicheFreeCats, 8, 5),
     ].slice(0, 8);
 
